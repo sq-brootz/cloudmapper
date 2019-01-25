@@ -373,6 +373,9 @@ class Rscluster(Leaf):
     def is_public(self):
        return pyjq.all('.PubliclyAccessible', self._json_blob)[0] 
     
+    def security_groups(self):
+        return pyjq.all('.VpcSecurityGroups[].VpcSecurityGroupId', self._json_blob)
+
     def __init__(self, parent, json_blob):
         self._type = "rscluster"
 

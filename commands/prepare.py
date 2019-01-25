@@ -156,36 +156,37 @@ def get_connections(cidrs, vpc, outputfilter):
                 # This is a private IP, ex. 10.0.0.0/16
 
                 # See if we should skip this
-                if not outputfilter["internal_edges"]:
-                    continue
+                if outputfilter["internal_edges"]:
+                    #continue
 
-                # Find all instances in this VPC and peered VPCs that are in this CIDR
-                for sourceVpc in itertools.chain(vpc.peers, (vpc,)):
+                    # Find all instances in this VPC and peered VPCs that are in this CIDR
+                    for sourceVpc in itertools.chain(vpc.peers, (vpc,)):
 
-                    # Ensure it is possible for instances in this VPC to be in the CIDR
-                    if not (IPNetwork(sourceVpc.cidr) in IPNetwork(cidr) or
-                            IPNetwork(cidr) in IPNetwork(sourceVpc.cidr)):
-                        # The CIDR from the security group does not overlap with the CIDR of the VPC,
-                        # so skip it
-                        continue
+                        # Ensure it is possible for instances in this VPC to be in the CIDR
+                        if not (IPNetwork(sourceVpc.cidr) in IPNetwork(cidr) or
+                                IPNetwork(cidr) in IPNetwork(sourceVpc.cidr)):
+                            # The CIDR from the security group does not overlap with the CIDR of the VPC,
+                            # so skip it
+                            continue
 
-                    # For each instance, check if one of its IPs is within the CIDR
-                    for sourceInstance in sourceVpc.leaves:
-                        for ip in sourceInstance.ips:
-                            if IPAddress(ip) in IPNetwork(cidr):
-                                # Instance found that can connect to instances in the SG
-                                # So connect this instance (sourceInstance) to every instance
-                                # in the SG.
-                                for targetInstance in sg_to_instance_mapping.get(sg["GroupId"], {}):
-                                    add_connection(connections, sourceInstance, targetInstance, sg)
+                        # For each instance, check if one of its IPs is within the CIDR
+                        for sourceInstance in sourceVpc.leaves:
+                            for ip in sourceInstance.ips:
+                                if IPAddress(ip) in IPNetwork(cidr):
+                                    # Instance found that can connect to instances in the SG
+                                    # So connect this instance (sourceInstance) to every instance
+                                    # in the SG.
+                                    for targetInstance in sg_to_instance_mapping.get(sg["GroupId"], {}):
+                                        add_connection(connections, sourceInstance, targetInstance, sg)
 
             else:
                 # This is an external IP (ie. not in a private range).
                 for instance in sg_to_instance_mapping.get(sg["GroupId"], {}):
                     # Ensure it has a public IP, as resources with only private IPs can't be reached
                     if instance.is_public:
-                        cidrs[cidr].is_used = True
-                        add_connection(connections, cidrs[cidr], instance, sg)
+                        if outputfilter["external_edges"]:
+                            cidrs[cidr].is_used = True
+                            add_connection(connections, cidrs[cidr], instance, sg)
 
         if outputfilter["internal_edges"]:
             # Connect allowed in Security Groups
@@ -311,13 +312,13 @@ def build_data_structure(account_data, config, outputfilter):
     # Find connections between nodes
     # Only looking at Security Groups currently, which are a VPC level construct
     connections = {}
-    if not outputfilter["no_external_edges"]:
-        for region in account.children:
-            for vpc in region.children:
-                for c, reasons in get_connections(cidrs, vpc, outputfilter).items():
-                    r = connections.get(c, [])
-                    r.extend(reasons)
-                    connections[c] = r
+#    if not outputfilter["no_external_edges"]:
+    for region in account.children:
+        for vpc in region.children:
+            for c, reasons in get_connections(cidrs, vpc, outputfilter).items():
+                r = connections.get(c, [])
+                r.extend(reasons)
+                connections[c] = r
 
     # Add external cidr nodes
     used_cidrs = 0
@@ -370,12 +371,14 @@ def run(arguments):
                         default=None, type=str)
     parser.add_argument("--vpc-names", help="VPC names to restrict to (ex. prod,dev)",
                         default=None, type=str)
-    parser.add_argument("--internal-edges", help="Show all connections (default)",
+    parser.add_argument("--internal-edges", help="Show internal connections (default)",
                         dest='internal_edges', action='store_true')
     parser.add_argument("--no-internal-edges", help="Only show connections to external CIDRs",
                         dest='internal_edges', action='store_false')
+    parser.add_argument("--external-edges", help="Show external connections (default)",
+                        dest='external_edges', action='store_true')
     parser.add_argument("--no-external-edges", help="Hide external connections",
-                        dest='no_external_edges', action='store_true')
+                        dest='external_edges', action='store_false')
     parser.add_argument("--inter-rds-edges", help="Show connections between RDS instances",
                         dest='inter_rds_edges', action='store_true')
     parser.add_argument("--no-inter-rds-edges", help="Do not show connections between RDS instances (default)",
@@ -400,7 +403,7 @@ def run(arguments):
     parser.set_defaults(read_replicas=True)
     parser.set_defaults(azs=True)
     parser.set_defaults(collapse_asgs=True)
-    parser.set_defaults(no_external_edges=False)
+    parser.set_defaults(external_edges=True)
 
     args = parser.parse_args(arguments)
 
@@ -415,7 +418,7 @@ def run(arguments):
         outputfilter["vpc-names"] = ','.join(['"' + r + '"' for r in args.vpc_names.split(',')])
 
     outputfilter["internal_edges"] = args.internal_edges
-    outputfilter["no_external_edges"] = args.no_external_edges
+    outputfilter["external_edges"] = args.external_edges
     outputfilter["read_replicas"] = args.read_replicas
     outputfilter["inter_rds_edges"] = args.inter_rds_edges
     outputfilter["azs"] = args.azs
