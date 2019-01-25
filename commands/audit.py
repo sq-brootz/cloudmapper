@@ -19,6 +19,11 @@ __description__ = "Identify potential issues such as public S3 buckets"
 def audit_s3_buckets(region):
     buckets_json = query_aws(region.account, "s3-list-buckets", region)
     buckets = pyjq.all('.Buckets[].Name', buckets_json)
+    public_buckets = []
+    private_buckets = []
+    bucket_policy_errors = []
+    bucket_acl_errors = []
+
     for bucket in buckets:
         # Check policy
         try:
@@ -30,12 +35,16 @@ def audit_s3_buckets(region):
                 policy = json.loads(policy_string)
                 policy = Policy(policy)
                 if policy.is_internet_accessible():
-                    if len(policy.statements) == 1 and len(policy.statements[0].actions) == 1 and 's3:GetObject' in policy.statements[0].actions:
-                        print('- Internet accessible S3 bucket via policy (only GetObject) {}'.format(bucket))
-                    else:
-                        print('- Internet accessible S3 bucket via policy {}: {}'.format(bucket, policy_string))
+                    public_buckets.append(bucket)
+                    #if len(policy.statements) == 1 and len(policy.statements[0].actions) == 1 and 's3:GetObject' in policy.statements[0].actions:
+                    #    print('- Internet accessible S3 bucket (only GetObject) {}'.format(bucket))
+                    #else:
+                    #    print('- Internet accessible S3 bucket {}'.format(bucket))
+                else:
+                    private_buckets.append(bucket)
         except Exception as e:
-            print('- Exception checking policy of S3 bucket {}: {}; {}'.format(bucket, policy_string, e))
+            bucket_policy_errors.append(bucket)
+            #print('- Couldn\'t check policy of S3 bucket: {}'.format(bucket))
 
         # Check ACL
         try:
@@ -46,18 +55,43 @@ def audit_s3_buckets(region):
                     uri == 'http://acs.amazonaws.com/groups/global/AuthenticatedUsers'):
                     print('- Public grant to S3 bucket via ACL {}: {}'.format(bucket, grant))
         except Exception as e:
-            print('- Exception checking ACL of S3 bucket {}: {}; {}'.format(bucket, grant, e))
+            bucket_acl_errors.append(bucket)
+            #print('- Couldn\'t check ACL of S3 bucket: {}'.format(bucket))
+        
+    # S3 Summary
+    print('')
+    print('*************************')
+    print('*****   S3 Summary  *****')
+    print('*************************')
+    print('')
+    print('> You have {} public buckets:'.format(len(public_buckets)))
+    for pubbucket in public_buckets:
+        print('\t' + pubbucket)
+    print('')
+    print('> You have {} private buckets'.format(len(private_buckets)))
+    print('')
+    if len(bucket_policy_errors) > 0:
+        print('> Couldn\'t check the policy of {} bucket(s). You probably lack permissions:'.format(len(bucket_policy_errors)))
+        for bucket in bucket_policy_errors:
+            print('\t' + bucket)
+        print('')
+    if len(bucket_acl_errors) > 0:
+        print('> Couldn\'t check the ACL of {} bucket(s). You probably lack permissions:'.format(len(bucket_acl_errors)))
+        for bucket in bucket_acl_errors:
+            print('\t' + bucket)
+        print('')
 
 
 def audit_s3_block_policy(region):
     caller_identity_json = query_aws(region.account, "sts-get-caller-identity", region)
     block_policy_json = get_parameter_file(region, 's3control', 'get-public-access-block', caller_identity_json['Account'])
     if block_policy_json is None:
-        print('- S3 Control Access Block is not on')
+        print('> S3 Control Access Block is not on')
     else:
         conf = block_policy_json['PublicAccessBlockConfiguration']
         if not conf['BlockPublicAcls'] or not conf['BlockPublicPolicy'] or not conf['IgnorePublicAcls'] or not conf['RestrictPublicBuckets']:
             print('- S3 Control Access Block is not blocking all access: {}'.format(block_policy_json))
+    print('')
 
 
 def audit_guardduty(region):
@@ -77,8 +111,19 @@ def audit_guardduty(region):
                 is_enabled = True
         if not is_enabled:
             regions_without.append(region.name)
+    
+    # GuardDuty Status
+    print('')
+    print('*************************')
+    print('*** GuardDuty Status ****')
+    print('*************************')
+    print('')
     if len(regions_without) != 0:
-        print('- GuardDuty not turned on for {}/{} regions: {}'.format(len(regions_without), possible_regions, regions_without))
+        print('> GuardDuty not turned on for {}/{} regions: {}'.format(len(regions_without), possible_regions, regions_without))
+        print('')
+    else:
+        print('> GuardDuty is enable on ALL THE THINGS!!!')
+        print('')
 
 
 def audit_cloudtrail(region):
@@ -126,10 +171,23 @@ def audit_root_user(region):
     root_user_mfa = json_blob.get('SummaryMap', {}).get('AccountMFAEnabled', 0)
     if root_user_mfa != 1:
         print('- Root user has no MFA')
-
+        
+    
+    # Root Account Summary
+    print('*************************')
+    print('****  Root Account  *****')
+    print('*************************')
+    print('')
+    if root_user_access_keys != 0:
+        print('> !!!!!!! Root user has {} access keys'.format(root_user_access_keys))
+    elif root_user_mfa != 1:
+        print('> !!!!!!! Root user has no MFA')
+    else:
+        print('> The root account is securely configured.  Hot dog!')
+    print('')
 
 def audit_users(region):
-    MAX_DAYS_SINCE_LAST_USAGE = 90
+    MIN_DAYS_SINCE_LAST_USAGE = 90
 
     def days_between(s1, s2):
         """s1 and s2 are date strings, such as 2018-04-08T23:33:20+00:00 """
@@ -149,7 +207,13 @@ def audit_users(region):
     csv_lines.pop(0)
 
     users_with_passwords = 0
-    users_with_password_but_no_mfa = 0
+    users_with_password_but_no_mfa = [] 
+    active_password_accounts = []
+    inactive_password_accounts = []
+    inactive_key_accounts = []
+    unused_password_accounts = []
+    unused_key_accounts = []
+    multi_key_accounts = []
 
     # Header:
     # user,arn,user_creation_time,password_enabled,password_last_used,password_last_changed,
@@ -188,51 +252,120 @@ def audit_users(region):
         if user['password_enabled'] == 'true':
             users_with_passwords += 1
             if user['mfa_active'] == 'false':
-                users_with_password_but_no_mfa += 1
-                print('- User with password login, but no MFA: {}'.format(user['user']))
+                users_with_password_but_no_mfa.append(user['user'])
+                #print('- User with password login, but no MFA: {}'.format(user['user']))
 
             if user['password_last_used'] == 'no_information':
-                print('- User has not logged in: {}'.format(user['user']))
+                unused_password_accounts.append(user['user'])
+                #print('- User has not logged in: {}'.format(user['user']))
             else:
                 password_last_used_days = days_between(collection_date, user['password_last_used'])
-                if password_last_used_days > MAX_DAYS_SINCE_LAST_USAGE:
-                    print('- User has not logged in for {} days: {}'.format(password_last_used_days, user['user']))
+                if password_last_used_days < MIN_DAYS_SINCE_LAST_USAGE:
+                    active_password_accounts.append(user['user'])
+                    #print('- User has logged in within the last {} days: {}'.format(password_last_used_days, user['user']))
+                else:
+                    inactive_password_accounts.append(user['user'])
 
         if user['access_key_1_active'] == "true" and user['access_key_2_active'] == "true":
-            print('- User with 2 active access keys: {}'.format(user['user']))
+            #print('- User with 2 active access keys: {}'.format(user['user']))
+            multi_key_accounts.append(user['user'])
 
         if user['access_key_1_active'] == "true":
             if user['access_key_1_last_used_date'] == "N/A":
-                print('- User has key1, but has never used it: {}'.format(user['user']))
+                unused_key_accounts.append(user['user'])
+                #print('- User has key1, but has never used it: {}'.format(user['user']))
             else:
                 days_since_key_use = days_between(collection_date, user['access_key_1_last_used_date'])
-                if days_since_key_use > MAX_DAYS_SINCE_LAST_USAGE:
-                    print('- User has not used key1 in {} days: {}'.format(days_since_key_use, user['user']))
+                if days_since_key_use > MIN_DAYS_SINCE_LAST_USAGE:
+                    inactive_key_accounts.append(user['user'])
+                    #print('- User last used key1 {} days ago: {}'.format(days_since_key_use, user['user']))
 
         if user['access_key_2_active'] == "true":
             if user['access_key_2_last_used_date'] == "N/A":
-                print('- User has key2, but has never used it: {}'.format(user['user']))
+                unused_key_accounts.append(user['user'])
+                #print('- User has key2, but has never used it: {}'.format(user['user']))
             else:
                 days_since_key_use = days_between(collection_date, user['access_key_2_last_used_date'])
-                if days_since_key_use > MAX_DAYS_SINCE_LAST_USAGE:
-                    print('- User has not used key2 in {} days: {}'.format(days_since_key_use, user['user']))
+                if days_since_key_use > MIN_DAYS_SINCE_LAST_USAGE:
+                    inactive_key_accounts.append(user['user'])
+                    #print('- User has not used key2 in {} days: {}'.format(days_since_key_use, user['user']))
 
     # Print summary
+    print('')
+    print('*************************')
+    print('***   User Summary   ****')
+    print('*************************')
+    print('')
+    print('>> You have {} total username/password accounts'.format(users_with_passwords))
+    print('')
+    if len(active_password_accounts) > 0:
+        print('>> There are {} active username/password accounts.  This ISN\'T normal. Check it out:'.format(len(active_password_accounts)))
+        for acc in active_password_accounts:
+            print('\t' + acc)
+        print('')
+    if len(inactive_password_accounts) > 0:
+        print('>> There are {} stale username/password accounts.  See if you can clean them out:'.format(len(inactive_password_accounts)))
+        for acc in inactive_password_accounts:
+            print('\t' + acc)
+        print('')
+    if len(unused_password_accounts) > 0:
+        print('>> There are {} username/password accounts that have never been logged in to.  Here comes the Ban Hammer!'.format(len(unused_password_accounts)))
+        for acc in unused_password_accounts:
+            print('\t' + acc)
+        print('')
     if users_with_password_but_no_mfa != 0:
-        print('- Of {} users with passwords, {} had no MFA ({:0.2f}%)'.format(users_with_passwords, users_with_password_but_no_mfa, float(users_with_password_but_no_mfa)/float(users_with_passwords)*100.0))
-
+        print('>> Of {} users with passwords, {} had no MFA ({:0.2f}%)'.format(users_with_passwords, len(users_with_password_but_no_mfa), float(len(users_with_password_but_no_mfa))/float(users_with_passwords)*100.0))
+        for acc in users_with_password_but_no_mfa:
+            print('\t' + acc)
+        print('')
+    if len(multi_key_accounts) > 0:
+        print('>> There are {} accounts with 2 MFA keys. You probably don\'t want that and should check it out.'.format(len(multi_key_accounts)))
+        for acc in multi_key_accounts:
+            print('\t' + acc)
+        print('')
 
 def audit_route53(region):
+    autorenew_missing = []
+    transferlock_missing = []
+
     json_blob = query_aws(region.account, "route53domains-list-domains", region)
     for domain in json_blob.get('Domains', []):
         if not domain['AutoRenew']:
-            print('- Route53 domain not set to autorenew: {}'.format(domain['DomainName']))
+            autorenew_missing.append(domain['DomainName'])
+            #print('- Route53 domain not set to autorenew: {}'.format(domain['DomainName']))
         if not domain['TransferLock']:
-            print('- Route53 domain transfer lock not set: {}'.format(domain['DomainName']))
+            transferlock_missing.append(domain['DomainName'])
+            #print('- Route53 domain transfer lock not set: {}'.format(domain['DomainName']))
+    
+    # Route53 summary
+    print('')
+    print('**************************')
+    print('***  Route53 Summary  ****')
+    print('**************************')
+    print('')
+    if len(autorenew_missing) > 0:
+        print('> Route53 domain not set to autorenew on {} domain(s):'.format(len(autorenew_missing)))
+        for d in autorenew_missing:
+            print('\t' + d)
+        print('')
+    if len(transferlock_missing) > 0:
+        print('> Route53 transferlock missing from {} domain(s):'.format(len(transferlock_missing)))
+        for d in transferlock_missing:
+            print('\t' + d)
+        print('')
+
+             
 
 
 def audit_ebs_snapshots(region):
+    unencrypted_snapshots = 0
+    total_snapshots = 0
+
     json_blob = query_aws(region.account, "ec2-describe-snapshots", region)
+    for snaphot in json_blob.get('Snapshots', []):
+        total_snapshots += 1
+        if not snaphot['Encrypted']:
+            unencrypted_snapshots += 1
     for snapshot in json_blob['Snapshots']:
         try:
             file_json = get_parameter_file(region, 'ec2', 'describe-snapshot-attribute', snapshot['SnapshotId'])
@@ -244,7 +377,21 @@ def audit_ebs_snapshots(region):
                     print('- EBS snapshot in {} is public: {}, entities allowed to restore: {}'.format(region.name, snapshot, attribute['Group']))
         except OSError:
             print('WARNING: Could not open {}'.format(file_name))
-
+    
+    # Snapshot summary
+    if total_snapshots > 0:
+        print('')
+        print('**************************')
+        print('** EBS Snapshot Summary **')
+        print('*** region: {}  ***'.format(region._name))
+        print('**************************')
+        print('')    
+        if unencrypted_snapshots > 0:
+            print('You have {} unencrypted EBS snapshots. You probably don\'t want that.'.format(unencrypted_snapshots))
+            print('')
+        else:
+            print('All of you EBS snapshots are encrypted. High five!')
+            print('')
 
 def audit_rds_snapshots(region):
     json_blob = query_aws(region.account, "rds-describe-db-snapshots", region)
@@ -545,23 +692,61 @@ def audit_lightsail(region):
 
 def audit(accounts, config):
     """Audit the accounts"""
+    print('llllllllllllllllllllN                   :+++++++++++++++++++')
+    print('lllllllllllllllll++lllN                 :+++++++++++++++++++')
+    print('lllllllllllllll++++lllllN               :+++++++++++++++++++')
+    print('lllllllllllll++++++lllllllN             :+++++++++++++++++++')
+    print('lllllllllll++++++++lllllllllN           :+++++++++++++++++++')
+    print('lllllllll++++++++++llllllllllllN        :+++++++++++++++++++')
+    print('lllllll++++++++++++llllllllllllllN      :+++++++++++++++++++')
+    print('lllll++++++++++++++llllllllllllllllN    :+++++++++++++++++++')
+    print('lll++++++++++++++++llllllllllllllllllN  :+++++++++++++++++++')
+    print('l++++++++++++++++++llllllllllllllllllllN:+++++++++++++++++++')
+    print('+++++++++++++++++++lllllllllllllllllllll:x++++++++++++++++++')
+    print('+++++++++++++++++++lllllllllllllllllllll:xxx++++++++++++++++')
+    print('+++++++++++++++++++lllllllllllllllllllll:xxxxx++++++++++++++')
+    print('+++++++++++++++++++lllllllllllllllllllll:xxxxxxx++++++++++++')
+    print('+++++++++++++++++++lllllllllllllllllllll:xxxxxxxxx++++++++++')
+    print('+++++++++++++++++++lllllllllllllllllllll:xxxxxxxxxxx++++++++')
+    print('+++++++++++++++++++lllllllllllllllllllll:xxxxxxxxxxxxx++++++')
+    print('+++++++++++++++++++lllllllllllllllllllll:xxxxxxxxxxxxxxx++++')
+    print('+++++++++++++++++++lllllllllllllllllllll:xxxxxxxxxxxxxxxxx++')
+    print('+++++++++++++++++++lllllllllllllllllllll:xxxxxxxxxxxxxxxxxxx')
+    print('+++++++++++++++++lllNlllllllllllllllllll:xxxxxxxxxxxxxxxxxx+')
+    print('+++++++++++++++lllll Nllllllllllllllllll:xxxxxxxxxxxxxxxx+++')
+    print('+++++++++++++lllllll   Nllllllllllllllll:xxxxxxxxxxxxxx+++++')
+    print('+++++++++++lllllllll     Nllllllllllllll:xxxxxxxxxxxx+++++++')
+    print('+++++++++lllllllllll       Nllllllllllll:xxxxxxxxxx+++++++++')
+    print('+++++++lllllllllllll         Nllllllllll:xxxxxxxx+++++++++++')
+    print('+++++lllllllllllllll           Nllllllll:xxxxxx+++++++++++++')
+    print('+++lllllllllllllllll             Nllllll:xxxx+++++++++++++++')
+    print('+lllllllllllllllllll               Nllll:xx+++++++++++++++++')
+    print('llllllllllllllllllll                 Nll:+++++++++++++++++++')
+    print('')
+    print('Welcome to the NerdMapper AWS Audit script!')
+    print('....or judgyMcJudgeFace.py')
+    print('')
+
+    print('Press "ENTER" to start the audit')
+    input()
 
     for account in accounts:
         account = Account(None, account)
         print('Finding resources in account {} ({})'.format(account.name, account.local_id))
+        print('')
 
         for region_json in get_regions(account):
             region = Region(account, region_json)
             try:
                 if region.name == 'us-east-1':
                     audit_s3_buckets(region)
+                    audit_s3_block_policy(region)
                     audit_cloudtrail(region)
                     audit_password_policy(region)
                     audit_root_user(region)
                     audit_users(region)
                     audit_route53(region)
                     audit_cloudfront(region)
-                    audit_s3_block_policy(region)
                     audit_guardduty(region)
                 audit_ebs_snapshots(region)
                 audit_rds_snapshots(region)

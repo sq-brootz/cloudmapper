@@ -40,7 +40,7 @@ class Severity:
         else:
             raise Exception("Unknown severity level")
 
-LOG_LEVEL = Severity.INFO
+LOG_LEVEL = Severity.ERROR
 
 def log_debug(msg, location=None, reasons=[]):
     log_issue(Severity.DEBUG, msg, location, reasons)
