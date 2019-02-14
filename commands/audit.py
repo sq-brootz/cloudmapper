@@ -11,6 +11,7 @@ from policyuniverse.policy import Policy
 
 from shared.common import parse_arguments, query_aws, get_parameter_file, get_regions
 from shared.nodes import Account, Region
+from tabulate import tabulate
 
 
 __description__ = "Identify potential issues such as public S3 buckets"
@@ -407,13 +408,44 @@ def audit_rds_snapshots(region):
 
 
 def audit_rds(region):
+    public_db = []
+    unencrypted_db = []
+    iam_auth = []
+
     json_blob = query_aws(region.account, "rds-describe-db-instances", region)
     for instance in json_blob.get('DBInstances', []):
+        if not instance['StorageEncrypted']:
+            unencrypted_db.append(instance['DBInstanceIdentifier'])
         if instance['PubliclyAccessible']:
+            public_db.append(instance['DBInstanceIdentifier'])
             print('- RDS instance in {} is public: {}'.format(region.name, instance['DBInstanceIdentifier']))
-        if instance.get('DBSubnetGroup', {}).get('VpcId', '') == '':
-            print('- RDS instance in {} is in VPC classic: {}'.format(region.name, instance['DBInstanceIdentifier']))
+        if instance['IAMDatabaseAuthenticationEnabled']:
+            iam_auth.append(instance['DBInstanceIdentifier'])
 
+    print('')
+    print('**************************')
+    print('****** RDS Summary *******')
+    print('*** region: {}  ***'.format(region._name))
+    print('**************************')
+    print('')
+    if len(unencrypted_db) > 0:
+        print('The following RDS instances are NOT encrypted:') 
+        print('')
+        for db in unencrypted_db:
+            print(db)
+        print('')
+    if len(public_db) > 0:
+        print('The following RDS instances are PUBLIC:')
+        print('')
+        for db in public_db:
+            print(db)
+        print('')
+    if len(iam_auth) > 0:
+        print('The following RDS instances are configured for IAM Dabatabse Authentication:')
+        print('')
+        for db in iam_auth:
+            print(db)
+        print('')
 
 def audit_amis(region):
     json_blob = query_aws(region.account, "ec2-describe-images", region)
@@ -537,7 +569,36 @@ def audit_sg(region):
     # TODO Check if security groups allow large CIDR range (ex. 1.2.3.4/3)
     # TODO Check if an SG allows overlapping CIDRs, such as 10.0.0.0/8 and then 0.0.0.0/0
     # TODO Check if an SG restricts IPv4 and then opens IPv6 or vice versa.
-    pass
+    unrestricted_sgs = []
+
+    json_blob = query_aws(region.account, "ec2-describe-security-groups", region)
+    for group in json_blob.get('SecurityGroups', []):
+        for inbound_rule in group.get('IpPermissions', []):
+            for cidr_range in inbound_rule.get('IpRanges'):
+                if cidr_range.get('CidrIp', '') == '0.0.0.0/0':
+                    sg_name = group['GroupName']
+                    sg_id = group['GroupId']
+                    start_port = inbound_rule['FromPort']
+                    end_port = inbound_rule['ToPort']
+                    
+                    unrestricted_sgs.append({'SecurityGroupName':sg_name, 'SecurityGroupID':sg_id, 'StartPort':start_port, 'EndPort':end_port})
+
+    if len(unrestricted_sgs) > 0:
+        header = unrestricted_sgs[0].keys()
+        rows = [x.values() for x in unrestricted_sgs]
+
+        print('')
+        print('**************************')
+        print('** Security Group Audit **')
+        print('*** region: {}  ***'.format(region._name))
+        print('**************************')
+        print('')  
+        print('- The following security groups have no IP restrictions')
+        print('')
+        print (tabulate(rows, header))
+        print('')
+        #print('- Security Group: {}, {} allows worldwide access to port {}'.format(sg_name, sg_id, start_port))
+
 
 
 def audit_lambda(region):
