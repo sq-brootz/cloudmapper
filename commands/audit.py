@@ -479,11 +479,36 @@ def audit_ecr_repos(region):
 
 
 def audit_redshift(region):
+    pub_redshift = []
+    unencrypted_redshift = []
+
     json_blob = query_aws(region.account, "redshift-describe-clusters", region)
     for cluster in json_blob.get('Clusters', []):
         if cluster['PubliclyAccessible']:
-            print('- Redshift is public: {} in {}'.format(cluster['ClusterIdentifier'], region.name))
+            pub_redshift.append(cluster['ClusterIdentifier'])
+        if not cluster.get('Encrypted', True):
+            unencrypted_redshift.append(cluster['ClusterIdentifier'])
 
+    if len(pub_redshift) > 0 or len(unencrypted_redshift) > 0:
+        print('')
+        print('**************************')
+        print('****  RedShift Audit  ****')
+        print('*** region: {}  ***'.format(region._name))
+        print('**************************')
+        print('')         
+    
+        if len(pub_redshift) > 0:
+            print('- The following RedShift cluster(s) are public:')
+            print('')
+            for db in pub_redshift:
+                print(db)
+        if len(unencrypted_redshift) > 0:
+            print('- The following RedShift cluster(s) are NOT encrypted:')
+            print('')
+            for db in unencrypted_redshift:
+                print(db)
+
+        print('')
 
 def audit_es(region):
     json_blob = query_aws(region.account, 'es-list-domain-names', region)
@@ -565,7 +590,7 @@ def audit_ec2(region):
                             for cidr_range in inbound_rule.get('IpRanges'):
                                 if cidr_range.get('CidrIp', '') == '0.0.0.0/0':
                                     open_ec2.append({'InstanceName':instance_name, 'InstanceID':instance['InstanceId'], 'Protocol':inbound_rule['IpProtocol'], 'StartPort':inbound_rule['FromPort'], 'EndPort':inbound_rule['ToPort'], 'InstanceState':instance.get('State', {}).get('Name', '')})
-                                    #print('Instance {} is open to the world on {} {}'.format(instance['InstanceId'], inbound_rule['IpProtocol'], inbound_rule['FromPort']))
+
     if len(open_ec2) > 0:
         header = open_ec2[0].keys()
         rows = [x.values() for x in open_ec2]
