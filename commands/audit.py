@@ -422,30 +422,33 @@ def audit_rds(region):
         if instance['IAMDatabaseAuthenticationEnabled']:
             iam_auth.append(instance['DBInstanceIdentifier'])
 
-    print('')
-    print('**************************')
-    print('****** RDS Summary *******')
-    print('*** region: {}  ***'.format(region._name))
-    print('**************************')
-    print('')
-    if len(unencrypted_db) > 0:
-        print('The following RDS instances are NOT encrypted:') 
+    if len(unencrypted_db) > 0 or len(public_db) > 0 or len(iam_auth) > 0:
+
         print('')
-        for db in unencrypted_db:
-            print(db)
+        print('**************************')
+        print('****** RDS Summary *******')
+        print('*** region: {}  ***'.format(region._name))
+        print('**************************')
         print('')
-    if len(public_db) > 0:
-        print('The following RDS instances are PUBLIC:')
-        print('')
-        for db in public_db:
-            print(db)
-        print('')
-    if len(iam_auth) > 0:
-        print('The following RDS instances are configured for IAM Dabatabse Authentication:')
-        print('')
-        for db in iam_auth:
-            print(db)
-        print('')
+
+        if len(unencrypted_db) > 0:
+            print('The following RDS instances are NOT encrypted:') 
+            print('')
+            for db in unencrypted_db:
+                print(db)
+            print('')
+        if len(public_db) > 0:
+            print('The following RDS instances are PUBLIC:')
+            print('')
+            for db in public_db:
+                print(db)
+            print('')
+        if len(iam_auth) > 0:
+            print('The following RDS instances are configured for IAM Dabatabse Authentication:')
+            print('')
+            for db in iam_auth:
+                print(db)
+            print('')
 
 def audit_amis(region):
     json_blob = query_aws(region.account, "ec2-describe-images", region)
@@ -520,10 +523,14 @@ def audit_cloudfront(region):
 def audit_ec2(region):
     json_blob = query_aws(region.account, 'ec2-describe-instances', region)
     route_table_json = query_aws(region.account, 'ec2-describe-route-tables', region)
+    sg_json = query_aws(region.account, 'ec2-describe-security-groups', region)
 
     ec2_classic_count = 0
+    open_ec2 = []
+
     for reservation in json_blob.get('Reservations', []):
         for instance in reservation.get('Instances', []):
+            instance_name = ''
             if instance.get('State', {}).get('Name', '') == 'terminated':
                 # Ignore EC2's that are off
                 continue
@@ -548,6 +555,31 @@ def audit_ec2(region):
                     print('  - No routes to instance, SourceDestCheck is not doing anything')
                 else:
                     print('  -Routes: {}'.format(route_to_instance))
+            for tag in instance.get('Tags', []):
+                if tag['Key'] == 'Name':
+                    instance_name = tag['Value']
+            for instance_sg in instance.get('SecurityGroups'):
+                for group in sg_json.get('SecurityGroups', []):
+                    if instance_sg.get('GroupId') == group.get('GroupId'):
+                        for inbound_rule in group.get('IpPermissions', []):
+                            for cidr_range in inbound_rule.get('IpRanges'):
+                                if cidr_range.get('CidrIp', '') == '0.0.0.0/0':
+                                    open_ec2.append({'InstanceName':instance_name, 'InstanceID':instance['InstanceId'], 'Protocol':inbound_rule['IpProtocol'], 'StartPort':inbound_rule['FromPort'], 'EndPort':inbound_rule['ToPort'], 'InstanceState':instance.get('State', {}).get('Name', '')})
+                                    #print('Instance {} is open to the world on {} {}'.format(instance['InstanceId'], inbound_rule['IpProtocol'], inbound_rule['FromPort']))
+    if len(open_ec2) > 0:
+        header = open_ec2[0].keys()
+        rows = [x.values() for x in open_ec2]
+
+        print('')
+        print('**************************')
+        print('*******  EC2 Audit  ******')
+        print('*** region: {}  ***'.format(region._name))
+        print('**************************')
+        print('')  
+        print('- The following EC2 Instances have SGs applied that are open to the world')
+        print('')
+        print (tabulate(rows, header))
+        print('')
 
     if ec2_classic_count != 0:
         print('- EC2 classic instances found: {}'.format(ec2_classic_count))
@@ -570,18 +602,44 @@ def audit_sg(region):
     # TODO Check if an SG allows overlapping CIDRs, such as 10.0.0.0/8 and then 0.0.0.0/0
     # TODO Check if an SG restricts IPv4 and then opens IPv6 or vice versa.
     unrestricted_sgs = []
+    assoc_instances = []
 
+    instance_json = query_aws(region.account, 'ec2-describe-instances', region)
     json_blob = query_aws(region.account, "ec2-describe-security-groups", region)
+    elb_json = query_aws(region.account, 'elb-describe-load-balancers', region)
+    elbv2_json = query_aws(region.account, 'elbv2-describe-load-balancers', region)
+
     for group in json_blob.get('SecurityGroups', []):
         for inbound_rule in group.get('IpPermissions', []):
             for cidr_range in inbound_rule.get('IpRanges'):
                 if cidr_range.get('CidrIp', '') == '0.0.0.0/0':
+                    instance_count = 0
+                    elb_count = 0
+
                     sg_name = group['GroupName']
                     sg_id = group['GroupId']
                     start_port = inbound_rule['FromPort']
                     end_port = inbound_rule['ToPort']
+
+                    for reservation in instance_json.get('Reservations', []):
+                        for instance in reservation.get('Instances', []):
+                            for instance_sg in instance.get('SecurityGroups'):
+                                if instance_sg.get('GroupId', '') == sg_id:
+                                    instance_count += 1
+
+                    for description in elb_json.get('LoadBalancerDescriptions', []):
+                        for elb_sg in description.get('SecurityGroups', []):
+                            if elb_sg == sg_id:
+                                elb_count += 1
+
+                    for load_balancer in elbv2_json.get('LoadBalancers', []):
+                        for elbv2_sg in load_balancer.get('SecurityGroups', []):
+                            if elbv2_sg == sg_id:
+                                elb_count += 1
                     
-                    unrestricted_sgs.append({'SecurityGroupName':sg_name, 'SecurityGroupID':sg_id, 'StartPort':start_port, 'EndPort':end_port})
+                    unrestricted_sgs.append({'SecurityGroupName':sg_name, 'SecurityGroupID':sg_id, 'StartPort':start_port, 'EndPort':end_port, 'AttachedInstances':instance_count, 'AttachedLBs':elb_count})
+    
+ 
 
     if len(unrestricted_sgs) > 0:
         header = unrestricted_sgs[0].keys()
